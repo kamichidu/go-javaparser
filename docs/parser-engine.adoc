@@ -1,0 +1,146 @@
+= go-javaparser Parser Engine & Error Recovery Design Specification
+:toc: left
+:sectnums:
+:source-highlighter: coderay
+
+This document defines the internal implementation strategy, design philosophies such as "on-demand body skipping", and the "error recovery design" that withstands incomplete source code being edited, of the core handwritten analyzer `Parser Core` (lexical analyzer Lexer and syntactic analyzer Parser) which is the heart of `go-javaparser`.
+
+---
+
+== Lexer Design (Lexer)
+
+The `lexer.Lexer` in the `Parser Core` is implemented as an extremely fast, allocation-minimal loop that scans the input Java source string (`[]rune` or `io.Reader`) from the beginning and generates a sequence of `lexer.Token`s.
+
+=== State Machine and Tokens
+The scan processing is implemented as a state transition machine for determining characters (alphanumerics, symbols, numbers, string literals, etc.) and is constructed in a flat loop using Go's `switch` statement.
+
+[source,go]
+----
+package lexer
+
+type TokenType int
+
+const (
+    TokEOF TokenType = iota
+    TokError
+    TokIdentifier // e.g. "MyClass"
+    TokKeyword    // e.g. "public", "class", "void"
+    TokLiteral    // e.g. "hello", 123
+    TokSymbol     // e.g. "{", "}", "(", ")", ";", ".", "@"
+)
+
+type Token struct {
+    Type    TokenType
+    Literal string
+    Line    int // 1-based
+    Col     int // 1-based
+}
+----
+
+---
+
+== Syntactic Analyzer Design (Parser Core)
+
+`parser.Parser` is a **handwritten recursive descent (Recursive Descent) parser core** that reads the generated token sequence using LL(k) (primarily 1 to 2 token lookaheads).
+
+=== Driving Independent Projections
+Whenever the `Parser Core` discovers a specific syntactic element during parsing, it notifies and drives the projection layers (AST Projection / Event Projection) selected by the consumer.
+The parser core itself does not care about the persistence of AST structures or the buffering method of event streams, focusing purely on syntactic analysis.
+
+---
+
+== Embodiment of Design Philosophy: On-Demand Body Skipping (Conceptual Non-existence of Bodies in Declaration Observation Context)
+
+On-demand body skipping is not merely a performance tuning or implementation technique.
+It is **the mechanism that embodies the core values "Prioritize observation over interpretation" and "Consumer-driven projections" in their purest form**.
+
+=== 1. Conceptual "Non-existence of Bodies"
+  In contexts where the consumer only requests to observe class or method "declarations (signatures)", the method or initializer block bodies (implementation parts) are **conceptually synonymous with "non-existent (void)"**.
+  "Bodies do not exist in the declaration observation context". Based on this solid principle, the Parser Core does not parse bodies when they appear, performs no allocations, treats them just like meaningless whitespace (or comments), and completely skips them (executes skipping).
+
+=== 2. Signature Only Mode (Signature Only Mode)
+  When scanning all files to build an index, the Parser Core runs in "Signature Only Mode".
+  In this mode, after parsing the method signature (name, parameters, return value), the parser core executes an ultra-fast skip process that simply counts the nested curly brace levels upon detecting the method's opening curly brace `{`.
+
+==== Skipping Algorithm Steps
+1. Set the curly brace depth counter to `depth = 1`.
+2. Sequentially read the next token.
+3. If the token is `{`, execute `depth++`; if `}`, execute `depth--`.
+4. The moment `depth == 0` is reached, terminate the skipping process and return to parsing the next class member declaration.
+
+This process does not generate any abstract syntax tree nodes or perform lexical/syntactic analysis of expressions, so memory allocation (Allocation) rarely occurs, achieving extreme analysis performance of under `1ms` per file.
+
+=== 3. Full Parse Mode (Full Parse Mode)
+  For definition jumps, completion requests, or actively edited files, the Parser Core runs in "Full Parse Mode".
+  In this mode, the parser core recursively descends and parses the inside of the method body's curly braces `{` to extract local variable declarations (`LocalVarDecl`) and identifier occurrences (Occurrences), streaming them to the corresponding projections (AST / Event).
+
+---
+
+== Syntax Error Tolerance and Error Recovery Design (Error Recovery)
+
+Code under active editing is always incomplete (brackets are not closed, semicolons are missing, etc.). If the Parser Core gives up and stops at the first minor error, its usefulness is significantly reduced.
+Therefore, a robust error recovery strategy is implemented in the `Parser Core`.
+
+=== Recovery Rule 1: Synchronize on Member Boundary
+If an unexpected token (syntax error) is detected while analyzing a class member declaration (fields or methods), the parser records the error and skips tokens until the following "Synchronization Tokens" appear.
+
+* **Synchronization Tokens**: `;`, `@` (start of annotation), modifiers (`public`, `private`, `static`, `final`), or type declaration keywords (`class`, `interface`).
+* **Effect**: Even if one method declaration is broken, the parser can correctly resume parsing the next method or field declaration to rescue it.
+
+[source,go]
+----
+// Synchronous recovery processing when an error occurs during class member analysis
+func (p *Parser) synchronizeMember() {
+    for {
+        tok := p.peek()
+        if tok.Type == TokEOF {
+            break
+        }
+        // Synchronization ends when the next member declaration boundary or a semicolon is found
+        if tok.Literal == ";" || p.isMemberModifier(tok) || tok.Literal == "@" || tok.Literal == "class" {
+            break
+        }
+        p.next() // Skip
+    }
+}
+----
+
+=== Recovery Rule 2: Rescuing Missing Closing Braces
+If the closing curly brace `}` of a class or method is missing near the end of a Java source file, normal parsers would fail the entire parse with an analysis error.
+* **Parser Core Response**:
+  If the depth counter is still non-zero when reaching the end of the file (EOF), the parser self-heals by determining that the remaining unclosed scopes were "implicitly closed at the EOF position", rescues the successfully parsed declarations up to that point, and sends them to the projections (Projections).
+
+---
+
+== v1 Local Scope Re-parsing (Incremental Friendly) Strategy
+
+To support ultra-low-latency processing at the keystroke level during real-time editing, the v1 version of `go-javaparser` intentionally does not perform complex and uncertain "Diff Detection (semantic AST diff extraction)" but adopts an extremely simple and robust re-parsing approach.
+
+=== 1. Elimination of Difference Detection
+  The parser itself does not compute any differences (Diff Calculation) at the text or syntax tree level between the previous and current parse results. This keeps the complexity of the parser low.
+
+=== 2. Consumer-Driven Range Specification and Local Analysis by Parser Core (Consumer-Driven Range Parsing)
+  Identifying the text range to be re-parsed is completely determined and controlled by the consumer. The Parser Core itself does not explore past ASTs or source code to "guess" the re-parse range.
+
+  * **Consumer's Role (Range Decision)**:
+    Consumers such as LSP servers identify and determine the exact range to apply re-parsing (e.g., lines and columns, or byte offset ranges from the start to end of the modified method) based on editing changes, extract the source text in that range, and provide it to the Parser Core.
+
+  * **Parser Core's Role (Local Analysis)**:
+    The Parser Core receives only the source text of the specified range passed by the consumer, and purely analyzes the syntax within that range (e.g. local variables and occurrences inside block bodies such as method bodies).
+    The obtained local parse results are either wrapped between `StartDeltaScopeEvent` / `EndDeltaScopeEvent` and projected as events, or directly handed over to the consumer as an AST projection.
+
+=== 3. Reporting Partial Parse Failure and Consumer Self-Decision
+  If local scope re-parsing fails due to mismatched brackets or nested severe syntax errors, **it is strictly forbidden for the Parser Core itself to automatically switch to full-file parsing**. This is because scheduling and fallback decisions belong to the consumer.
+
+  * **Parser Core's Role**:
+    Upon detecting inconsistencies or errors in the local parse, the Parser Core aborts the process and reports the failure as a **`Partial Parse Failure`** to the caller (consumer).
+
+  * **Consumer's Options (Consumer-Driven Policy)**:
+    Upon receiving the report, the consumer autonomously decides and selects one of the following response policies depending on its use case and latency tolerance.
+
+    Maintain stale facts::
+      Maintains existing valid information in memory (buffers or symbol tables) on the spot, preventing sudden disappearance of old symbols. This is ideal for maintaining consistency of editor projections during incomplete syntax states during keystrokes.
+    Asynchronous Complete Parse Request (Background Complete Parse)::
+      Requests a `complete parse` of the entire file as a background job queue (asynchronous task) to eventually converge on consistent data without blocking main thread processing (such as LSP responses).
+    Synchronous Complete Parse Fallback::
+      Executes a `complete parse` of the entire file synchronously and falls back immediately only in specific contexts where synchronous execution and complete data integrity are tolerated (or required), such as execution via CLI commands or reference resolution queries.

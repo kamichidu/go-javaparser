@@ -1,0 +1,142 @@
+= go-javaparser Global Architecture Design Specification
+:toc: left
+:sectnums:
+:source-highlighter: coderay
+
+This document defines the overall architecture, design philosophy, and subsystem design of `go-javaparser` (`github.com/kamichidu/go-javaparser`), a standalone high-speed Java parsing library designed for tools and editor integrations that require highly efficient and ultra-low-latency Java syntactic analysis.
+
+---
+
+== Core Philosophy
+
+The supreme axiom driving all design decisions and code implementations in `go-javaparser` is consolidated in the following single sentence:
+
+[quote]
+Complete knowledge is optional. Observation latency is not.
+
+Rather than making the parser overly intelligent to run heavy static analysis or blocking execution waiting for complete type resolution, our absolute reason for existence is to deliver only the "observed facts" on the fly to the consumer with minimal latency.
+
+---
+
+== Core Values (Design Constitution)
+
+To embody the Core Philosophy mentioned above and serve as the decision-making standard for developers when they are in doubt, `go-javaparser` establishes the following four core values (design constitution) and strictly adheres to them.
+
+Observation Before Interpretation::
+  **Prioritize observation over interpretation.**
+  The role of the parser is to "observe" and accurately report physical facts written in the source code (import declarations, annotations, member signatures, physical coordinates) as they are.
+  It does not perform any import resolution or semantic "interpretation" (type resolution, name binding, mapping) to identify what an identifier refers to, leaving it entirely to the upstream consumer.
+Streaming Before Materialization::
+  **Prioritize streaming over materialization.**
+  Instead of fully constructing and retaining a massive AST in memory (materialization) before passing it over, we prioritize a design that sequentially streams (pushes) observed elements as events in the order of appearance during lexical and syntactic analysis.
+  This suppresses allocations and operates with a minimal memory footprint even for gigabyte-scale codebases.
+Incremental Friendly::
+  **Affinity for incremental (differential) processing.**
+  To support ultra-low-latency processing at the keystroke level during real-time editing in editors, we avoid re-parsing the entire file, maintaining an incremental-friendly structure where only specific modified scopes (such as method bodies) can be parsed locally and merged differentially.
+Consumer-Driven Projections::
+  **Consumer-driven projections.**
+  The execution profile and analysis detail level of the parser are dynamically determined by the subscription policy of the consuming side (consumer).
+  If the consumer does not request occurrence information (Occurrences), and the context is only to observe declarations, the method body is conceptually synonymous with "non-existent (void)". The Parser Core completely skips (On-Demand Skipping) the parsing of method bodies and AST node generation itself, projecting the minimum required information in the context at maximum speed.
+
+---
+
+== Two Independent Projections Architecture
+
+The core design of `go-javaparser` lies in the **separation of the handwritten parser core (Parser Core) and the two completely independent projection layers (Projections) output from it**.
+
+```text
+               +-----------------------------+
+               |         Parser Core         | (Handwritten LL(k) Parser Core)
+               +--------------+--------------+
+                              |
+              +---------------+---------------+
+              |                               |
+              v                               v
+    +-------------------+           +-------------------+
+    |  AST Projection   |           |  Event Projection |
+    +-------------------+           +-------------------+
+    | Declaration-      |           | Event Stream      |
+    | Oriented AST      |           | (Direct Stream)   |
+    | (Materialized AST)|           |                   |
+    +-------------------+           +-------------------+
+```
+
+The AST Projection and Event Projection are completely independent of each other, and neither package imports (depends on) the other. Consumers can freely choose to consume **"only one" or "both simultaneously"** depending on their use cases.
+
+AST Projection (Declaration-Oriented AST)::
+  Receives tokens from the parser core, reconstructs and materializes the declaration structure in memory, and returns an `ast.File` tree.
+  * **Optimal Use Case**: When you want to retain and traverse a tree structure, such as class outline displays, structure tree visualizations, code formatters, or batch static analysis tools.
+Event Projection (Event Stream)::
+  Directly pushes (Direct Stream) syntactic events (`SourceEvent`) on the fly as the parser core parses, without constructing or accumulating intermediate ASTs in memory.
+  * **Optimal Use Case**: When you want to reduce AST construction overhead and memory consumption to the absolute limit, such as low-latency background index construction or ultra-fast asynchronous symbol extraction from large repositories.
+
+---
+
+== Design Constraints
+
+To support the Core Philosophy from a technical perspective, development is executed under the following constraints.
+
+=== 1. Zero Third-Party Dependencies
+  We implement the lexer (Lexer) and syntactic analyzer (Parser) as a **completely handwritten lexer and parser** that works using only Go's standard library, without using any external parser generators such as ANTLR, GoCC, or goyacc.
+  This minimizes the compiled binary size and maximizes startup and loading speeds.
+
+=== 2. Declaration-Oriented AST
+  We do not construct a "complete Concrete Syntax Tree (CST)" for expressions or detailed grammar checking that a compiler would require.
+  We retain and construct only a lightweight "Source AST (Declaration-Oriented AST)" specialized for declaration structures (Package, Import, Type, Method, Field, Local Variable) required by symbol index construction, outline displays, and code definition references.
+
+---
+
+== Package Structure
+
+The directory structure within the repository is defined as follows by applying standard Go multi-package design and thoroughly eliminating circular dependencies.
+All elements are described in a directory tree using only ASCII.
+
+```text
+/github.com/kamichidu/go-javaparser/
+|-- go.mod
+|-- docs/
+|   |-- architecture.adoc      # This document (Global Architecture Specification)
+|   |-- ast.adoc               # Source AST Design Specification
+|   |-- event-emitter.adoc     # Event Stream Design Specification
+|   `-- parser-engine.adoc     # Parser Engine & Error Recovery Specification
+|-- syntax/
+|   `-- syntax.go              # [Shared] Common physical coordinates (Range/Position) and common syntax types (TypeKind/Parameter)
+|-- ast/
+|   `-- ast.go                 # Declaration-Oriented Source AST node definitions (depends only on syntax)
+|-- lexer/
+|   |-- lexer.go               # High-speed lexical analyzer (Scanner) implementation
+|   `-- token.go               # Token definitions and constants
+|-- parser/
+|   |-- parser.go              # Handwritten Parser Core implementation (depends on syntax, ast, event)
+|   `-- errors.go              # Parse error handling
+`-- event/
+    |-- event.go               # SourceEvent definitions (depends only on syntax, completely eliminates ast dependency)
+    `-- emitter.go             # Independent event projection handler
+```
+
+The responsibilities of each package are specified as follows:
+
+syntax::
+  A **non-logical common syntax data model (DTO)** used by both AST and Event, such as `Range` and `Position` representing physical coordinates, type category `TypeKind`, and formal parameter structure `Parameter`.
+ast::
+  A set of immutable-oriented data structures (nodes) that type-safely represent declarative syntax elements extracted from the Java Language Specification (JLS). It imports only the `syntax` package.
+lexer::
+  A lexical analyzer that scans identifiers, keywords, literals, and symbols from a Java source code string stream at ultra-high speed.
+parser::
+  A handwritten LL(k) recursive descent (Recursive Descent) parser that builds ASTs or emits events from a token stream according to the consumer's request (projection target).
+event::
+  A boundary that defines the `SourceEvent Stream` that downstream consumers (indexers, LSP servers, etc.) can subscribe to and provides independent push delivery. It imports only the `syntax` package and completely eliminates any dependency on the `ast` package.
+
+---
+
+== Pipeline Processing Flow
+
+The process from analyzing a single Java source file to sending data to each projection layer is as follows:
+
+1. **Lexical Scan Phase**:
+   The `lexer.Lexer` scans the source code and generates a sequence of `lexer.Token`s. Whitespace and comments, except those required for documentation such as Javadoc, are efficiently skipped in this phase.
+2. **Syntactic Analysis (Core Parsing) & Independent Projections Phase**:
+   The `parser.Parser` runs.
+   * **When AST Projection is enabled**: The parser builds an `ast.File` syntax tree node using the data structures of `syntax` and returns it upon completion.
+   * **When Event Projection is enabled**: The parser sends events (DTOs based on `syntax`) directly to `event.EventSink` on detecting syntactic elements, without building or materializing intermediate ASTs.
+   * **When both are enabled**: Builds the AST while simultaneously emitting events in parallel.
